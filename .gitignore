@@ -6,3 +6,4 @@ data/
 training/
 training*/
 __pycache__
+*.keras
