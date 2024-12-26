@@ -4,3 +4,5 @@ venv/
 secrets.yaml
 data/
 training/
+training*/
+__pycache__
