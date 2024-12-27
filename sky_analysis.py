@@ -1,27 +1,69 @@
 from __future__ import annotations
 
 import os
+import json
 import logging
 import math
 import numpy as np
 import keras
 
 from datetime import datetime
-from pprint import pprint
 from paho.mqtt import client as mqtt_client
-from PIL import Image, ImageOps  # Install pillow instead of PIL
-
-# TODO: use this
-#from pysolar.solar import *
+from PIL import Image, ImageOps
+from pprint import pprint
 
 from config import settings
 
 VERSION = "0.1.0"
 DEBUG = False
+OVERRIDE = None
+OVERRIDE = "ccd1_20241223_214213.jpg"
+
+## Don't change this unless trained with a different size
+IMAGE_SIZE = (256, 256)
+
+OKTA_WEIGHT_LIGHT_CLOUDS = 0.5
+OKTA_WEIGHT_MEDIUM_CLOUDS = 0.75
+OKTA_WEIGHT_THICK_CLOUDS = 1.0
 
 logger = logging.getLogger()
 
-def connect_mqtt(host: string, port: number, client_id: string, username: string, password: string):
+expected_allsky_topics = [
+    "latest", # binary image data
+    "exp_date", # 2024-12-27 08:20:46
+    "exposure", # 0.002794
+    "gain", # 0
+    "bin", # 1
+    "temp", # 20.0
+    "sunalt", # 7.7
+    "moonalt", # 31.3
+    "moonphase", # 11.6
+    "mooncycle", # 89.0
+    "moonmode", # False
+    "night", # False
+    "sqm", # 2844443.5
+    "stars", # 0
+    "latitude", # 30.877
+    "longitude", # -84.54
+    "elevation", # 40
+    "kpindex", # 0.67
+    "ovation_max", # 0
+    "smoke_rating", # Clear
+    "aircraft", # 0
+    "sidereal_time", # 14:08:41.25
+]
+
+allsky_obj = {}
+
+def make_allsky_object():
+    new_allsky_obj = {}
+
+    for allsky_prop in expected_allsky_topics:
+        new_allsky_obj[allsky_prop] = None
+
+    return new_allsky_obj
+
+def create_mqtt_client(client_id: string, username: string, password: string):
     def on_connect(client, userdata, flags, rc, properties):
         if rc == 0:
             logger.info("Connected to MQTT Broker!")
@@ -37,10 +79,11 @@ def connect_mqtt(host: string, port: number, client_id: string, username: string
 
     client.on_connect = on_connect
 
+    return client
+
+def connect_mqtt_client(client: mqtt_client, host: string, port: number, ):
     logger.info(f"Connecting to MQTT broker at {host}:{port}")
     client.connect(host, port)
-
-    return client
 
 def subscribe(client: mqtt_client, topic: string, image_callback):
     client.subscribe(topic)
@@ -60,7 +103,7 @@ def setup_logging():
 
     logger.setLevel(logging.INFO)
 
-    logger.info("ML Sky Analysis starting...")
+    logger.info(f"ML Sky Analysis v{VERSION} starting...")
 
     # Disable scientific notation for clarity
     np.set_printoptions(suppress=True)
@@ -84,22 +127,19 @@ def load_model():
 
 def analyze_image(model, images_classes, imageBytes):
     start_time = datetime.now()
-    image_size = (256, 256)
 
-    # determined by the first position in the shape tuple, in this case 1
-    #data = np.ndarray(shape=(1, 256, 256, 3), dtype=np.float32)
-
-
-    original_file = os.path.join(settings.datadir, "ccd1_20241223_214213.jpg")
-    # original_file = os.path.join(settings.datadir, "original.jpg")
+    original_file = os.path.join(settings.datadir, "original.jpg")
     cropped_file = os.path.join(settings.datadir, "cropped.jpg")
+    
+    if OVERRIDE is not None:
+        original_file = os.path.join(settings.datadir, OVERRIDE)
+    else:
+        # write the original file received from mqtt
+        with open(original_file, "wb") as f:
+            f.write(imageBytes)
 
-    # write the original file received from mqtt
-    # with open(original_file, "wb") as f:
-    #   f.write(imageBytes)
-
-    # load the original file we just write. this could likely be done all in memory without
-    # first saving the original file, but i kinda like having the original to see for testing
+    # load the original file we just wrote. this could be done all in memory without
+    # first saving the original file, but i like having the original to see for testing
     # purposes and i doubt the performance impact could be that big from the extra write/read
     # operation. so leaving it this way
     original_image = Image.open(original_file)
@@ -125,9 +165,9 @@ def analyze_image(model, images_classes, imageBytes):
 
     tiles = []
     tile_results = []
-    tile_index = 0
     total_oktas = 0
     total_weighted_oktas = 0
+    tile_mapping = []
     # cloudy_count = 0
 
     # crop the tiles
@@ -138,123 +178,197 @@ def analyze_image(model, images_classes, imageBytes):
 
             tiles.append(cropped_image.crop((x_offset, y_offset, x_offset+tile_w, y_offset+tile_h)))
 
-    # loop through the tiles and perform inference on each
-    for tile_index in range(0, settings.crop_sections):
+    # create an array to use for inference that will contain all of the tiles
+    data = np.ndarray(shape=(total_tiles,) + IMAGE_SIZE + (3,), dtype=np.float32)
+    data_index = 0
 
+    # loop through the tiles and perform inference on each
+    for i, tile in enumerate(tiles):
         # skip discarded tiles
-        if tile_index in settings.discard_crop_sections:
+        if i in settings.discard_crop_sections:
             continue
 
-        tile = tiles[tile_index]
-        tile_path = os.path.join(settings.datadir, f"tile_{tile_index}.jpg")
-        tile.save(tile_path)
+        # this is used for later determining which tile was predicted
+        tile_mapping.append(i)
 
-        ## keras v3
-        image = tile.resize(image_size)
-        image_array = np.array(image) / 255.0
-        image_array = np.expand_dims(image_array, axis=0)
+        # resize save the cropped tile
+        tile_path = os.path.join(settings.datadir, f"tile_{i}.jpg")
+        image = tile.resize(IMAGE_SIZE)
+        image.save(tile_path)
 
-        prediction = model.predict(image_array, verbose=0)
+        # add the tile to the analysis array
+        data[data_index] = np.array(image) / 255.0
+        data_index += 1
+
+
+    predictions = model.predict(data, verbose=0)
+
+    if DEBUG:
+        pprint(predictions)
+
+    for i, prediction in enumerate(predictions):
+        tile_num = tile_mapping[i]
+
         top_score_index = np.argmax(prediction)
         image_class = images_classes[top_score_index]
-        confidence_score = float(prediction[0][top_score_index])
+        confidence_score = float(prediction[top_score_index])
 
-        clear_night_confidence = float(prediction[0][0])
-        light_clouds_night_confidence = float(prediction[0][1])
-        medium_clouds_night_confidence = float(prediction[0][2])
-        thick_clouds_night_confidence = float(prediction[0][3])
+        ## calculate the weighted oktas value using prediction confidence for
+        ## each relevant class
+        clear_night_confidence = float(prediction[0])
+        light_clouds_night_confidence = float(prediction[1])
+        medium_clouds_night_confidence = float(prediction[2])
+        thick_clouds_night_confidence = float(prediction[3])
 
-        total_weighted_oktas += light_clouds_night_confidence * 0.5 * okta_factor
-        total_weighted_oktas += medium_clouds_night_confidence * 0.75 * okta_factor
-        total_weighted_oktas += thick_clouds_night_confidence * 1 * okta_factor
+        total_weighted_oktas += light_clouds_night_confidence * OKTA_WEIGHT_LIGHT_CLOUDS * okta_factor
+        total_weighted_oktas += medium_clouds_night_confidence * OKTA_WEIGHT_MEDIUM_CLOUDS * okta_factor
+        total_weighted_oktas += thick_clouds_night_confidence * OKTA_WEIGHT_THICK_CLOUDS * okta_factor
 
-
-        ## keras v2
-        # tile_rgb = tile.convert("RGB")
-
-        # # resizing the image to be at least 224x224 and then cropping from the center
-        # tile_resized = ImageOps.fit(tile_rgb, image_size, Image.Resampling.LANCZOS)
-
-        # # turn the image into a numpy array
-        # image_array = np.asarray(tile_resized)
-
-        # # Normalize the image
-        # normalized_image_array = (image_array.astype(np.float32) / 127.5) - 1
-
-        # # Load the image into the array
-        # data[0] = normalized_image_array
-
-        # # Predicts the model
-        # prediction = model.predict(data, verbose=2)
-        # index = np.argmax(prediction)
-        # image_class = images_classes[index]
-        # confidence_score = prediction[0][index]
-
-        # Print prediction and confidence score
         if DEBUG:
             pprint(prediction, depth=4)
-            print(f"Tile {tile_index:02} result: {image_class.ljust(6)} / {round(confidence_score * 100, 2)}% confidence")
+            logger.debug(f"Tile {tile_num:02} result: {image_class.ljust(6)} / {round(confidence_score * 100, 2)}% confidence")
 
         okta_score = 0
 
         if 'light_clouds' in image_class:
-            okta_score = 0.5
+            okta_score = OKTA_WEIGHT_LIGHT_CLOUDS
         elif 'medium_clouds' in image_class:
-            okta_score = 0.75
+            okta_score = OKTA_WEIGHT_MEDIUM_CLOUDS
         elif 'thick_clouds' in image_class:
-            okta_score = 1
+            okta_score = OKTA_WEIGHT_THICK_CLOUDS
 
         total_oktas += (okta_score * okta_factor)
 
         tile_results.append({
-            "tile": tile_index,
+            "tile": tile_num,
             "class": image_class,
-            "confidence": round(confidence_score, 4)
+            "confidence": round(confidence_score, 3)
         })
 
 
     total_oktas = int(round(total_oktas, 0))
-    total_weighted_oktas = int(round(total_weighted_oktas, 0))
     
+    # in theory, this sanity check shouldn't be needed.. but leaving it anyways since an okta
+    # can never be negative nor can it be over 8
     if total_oktas < 0:
         total_oktas = 0
     elif total_oktas > 8:
         total_oktas = 8
 
-    cloudy_pct = total_oktas / 8
-    
-    end_time = datetime.now()
-    elapsed = end_time - start_time
-    elapsed_ms = round(elapsed.microseconds / 1000, 0)
-
     return({
-        "cloud_coverage": cloudy_pct,
-        "elapsed_ms": elapsed_ms,
+        # calculate the cloud coverage based on the weighted okta value
+        "cloud_coverage": round((total_weighted_oktas / 8), 3),
+        "elapsed_ms": int(round((datetime.now() - start_time).microseconds / 1000, 0)),
         "oktas": total_oktas,
-        "oktas_weighted": total_weighted_oktas,
+        "oktas_weighted": int(round(total_weighted_oktas, 0)),
         "tiles": tile_results
     })
 
+def check_allsky_receive_complete(allsky_obj):
+    for allsky_prop in expected_allsky_topics:
+        if allsky_obj[allsky_prop] is None:
+            return False
+
+    return True
+
+def image_received_callback(client, userdata, msg):
+    allsky_topic = str(msg.topic).removeprefix(f"{settings.mqtt.allsky_topic}/")
+
+    if allsky_topic in expected_allsky_topics:
+        if allsky_topic == "latest": 
+            logger.info(f"Received image from `{msg.topic}` topic")
+            userdata["allsky_obj"][allsky_topic] = msg.payload
+        else:
+            payload = msg.payload.decode("utf-8")
+            logger.info(f"Received `{payload}` from `{msg.topic}` topic")
+            userdata["allsky_obj"][allsky_topic] = payload
+
+        done = check_allsky_receive_complete(userdata["allsky_obj"])
+
+        logger.debug(f"Allsky object done: {done}")
+
+        if done:
+            # process
+            analysis_result = analyze_image(userdata["model"], userdata["images_classes"], userdata["allsky_obj"]["latest"])
+
+            if DEBUG:
+                pprint(analysis_result)
+            
+            logger.info(f"Analysis results: {analysis_result}")
+
+            ## send mqtt message
+            send_object = {
+                "date": userdata["allsky_obj"]["exp_date"],
+                "camera_info": {
+                    "exposure": float(userdata["allsky_obj"]["exposure"]), # 0.002794
+                    "gain": int(userdata["allsky_obj"]["gain"]), # 0
+                    "bin": int(userdata["allsky_obj"]["bin"]), # 1
+                    "temp": float(userdata["allsky_obj"]["temp"]), # 20.0
+                },
+                "astro": {
+                    "sunalt": float(userdata["allsky_obj"]["sunalt"]), # 7.7
+                    "moonalt": float(userdata["allsky_obj"]["moonalt"]), # 31.3
+                    "moonphase": float(userdata["allsky_obj"]["moonphase"]), # 11.6
+                    "mooncycle": float(userdata["allsky_obj"]["mooncycle"]), # 89.0
+                    "moonmode": userdata["allsky_obj"]["moonmode"] == 'True', # False
+                    "night": userdata["allsky_obj"]["night"] == 'True', # False
+                    "sidereal_time": userdata["allsky_obj"]["sidereal_time"], # 14:08:41.25
+                },
+                "location": {
+                    "latitude": float(userdata["allsky_obj"]["latitude"]), # 30.877
+                    "longitude": float(userdata["allsky_obj"]["longitude"]), # -84.54
+                    "elevation": int(userdata["allsky_obj"]["elevation"]), # 40
+                },
+                "sky": {
+                    "cloud_coverage": analysis_result["cloud_coverage"],
+                    "oktas": analysis_result["oktas"],
+                    "oktas_weighted": analysis_result["oktas_weighted"],
+                    "sqm": float(userdata["allsky_obj"]["sqm"]), # 2844443.5
+                    "stars": int(userdata["allsky_obj"]["stars"]), # 0
+                    "kpindex": float(userdata["allsky_obj"]["kpindex"]), # 0.67
+                    "ovation_max": float(userdata["allsky_obj"]["ovation_max"]), # 0
+                    "smoke_rating": userdata["allsky_obj"]["smoke_rating"], # Clear
+                    "aircraft": int(userdata["allsky_obj"]["aircraft"]), # 0
+
+                },
+                "analysis": analysis_result,
+            }
+
+            if DEBUG:
+                pprint(send_object)
+
+            result = client.publish(settings.mqtt.tx_topic, json.dumps(send_object), retain=True)
+
+            status = result[0]
+            if status == 0:
+                logger.info(f"Sent sky analysis to topic `{settings.mqtt.tx_topic}`")
+            else:
+                logger.error(f"Failed to send sky analysis to topic {settings.mqtt.tx_topic}")
+            
+            ## reset the allsky object
+            userdata["allsky_obj"] = make_allsky_object()
+
 
 def main():
+    # global allsky_obj
+
     setup_logging()
     setup_datadir()
 
     model, images_classes = load_model()
 
-    mqtt_rx_client = connect_mqtt(settings.mqtt_rx.host, settings.mqtt_rx.port, settings.mqtt_rx.client_id, settings.mqtt_rx.username, settings.mqtt_rx.password)
-    # mqtt_tx_client = None
+    mqtt_client = create_mqtt_client(settings.mqtt.client_id, settings.mqtt.username, settings.mqtt.password)
+    mqtt_client.user_data_set({
+        "model": model,
+        "images_classes": images_classes, 
+        "allsky_obj": make_allsky_object()
+    })
+    connect_mqtt_client(mqtt_client, settings.mqtt.host, settings.mqtt.port)
 
-    def image_received_callback(client, userdata, msg):
-        logger.info(f"Received image from `{msg.topic}` topic")
-        result = analyze_image(model, images_classes, msg.payload)
-        pprint(result)
-        exit()
-        logger.info(f"Analysis results: {result}")
+    # subscribe to latest image binary data topic
+    subscribe(mqtt_client, f"{settings.mqtt.allsky_topic}/#", image_received_callback)
 
-    subscribe(mqtt_rx_client, settings.mqtt_rx.topic, image_received_callback)
-
-    mqtt_rx_client.loop_forever()
+    mqtt_client.loop_forever()
 
 if __name__ == "__main__":
     main()
