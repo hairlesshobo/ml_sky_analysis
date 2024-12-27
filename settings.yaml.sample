@@ -1,0 +1,28 @@
+---
+latitude: 30
+longitude: -84
+# datadir: ~/data
+model_data: sky_analysis.keras
+model_labels: labels.txt
+crop_l: 650
+crop_t: 400
+crop_r: 1000
+crop_b: 600
+crop_sections: 36
+day_altitude: -12
+mqtt_rx:
+  enable: true
+  host: broker_address
+  port: 1883
+  client_id: sky-analysis
+  username: ""
+  password: ""
+  topic: indi-allsky/latest
+mqtt_tx:
+  enable: false
+  host: broker_address
+  port: 1883
+  client_id: sky-analysis
+  username: ""
+  password: ""
+  topic: "weather/sky"
