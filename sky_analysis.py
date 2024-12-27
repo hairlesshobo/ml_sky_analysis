@@ -6,6 +6,7 @@ import math
 import numpy as np
 import keras
 
+from datetime import datetime
 from pprint import pprint
 from paho.mqtt import client as mqtt_client
 from PIL import Image, ImageOps  # Install pillow instead of PIL
@@ -16,6 +17,7 @@ from PIL import Image, ImageOps  # Install pillow instead of PIL
 from config import settings
 
 VERSION = "0.1.0"
+DEBUG = False
 
 logger = logging.getLogger()
 
@@ -81,13 +83,14 @@ def load_model():
     return model, image_classes
 
 def analyze_image(model, images_classes, imageBytes):
+    start_time = datetime.now()
     image_size = (256, 256)
 
     # determined by the first position in the shape tuple, in this case 1
     #data = np.ndarray(shape=(1, 256, 256, 3), dtype=np.float32)
 
-    original_file = os.path.join(settings.datadir, "ccd1_20241223_214213.jpg")
 
+    original_file = os.path.join(settings.datadir, "ccd1_20241223_214213.jpg")
     # original_file = os.path.join(settings.datadir, "original.jpg")
     cropped_file = os.path.join(settings.datadir, "cropped.jpg")
 
@@ -113,15 +116,18 @@ def analyze_image(model, images_classes, imageBytes):
     tile_w = crop_w / crop_each_direction
     tile_h = crop_h / crop_each_direction
 
+    total_tiles = settings.crop_sections - len(settings.discard_crop_sections)
+
     # an okta is defined as how many 8th's of the sky is covered by clouds, so since
     # we are dividing into multiple parts and classifying by how dense the clouds are
     # in each tile, we need to create a factor based on the total number of crop sections
-    okta_factor = 8 / settings.crop_sections
+    okta_factor = 8 / total_tiles
 
     tiles = []
     tile_results = []
     tile_index = 0
     total_oktas = 0
+    total_weighted_oktas = 0
     # cloudy_count = 0
 
     # crop the tiles
@@ -133,7 +139,13 @@ def analyze_image(model, images_classes, imageBytes):
             tiles.append(cropped_image.crop((x_offset, y_offset, x_offset+tile_w, y_offset+tile_h)))
 
     # loop through the tiles and perform inference on each
-    for tile in tiles:
+    for tile_index in range(0, settings.crop_sections):
+
+        # skip discarded tiles
+        if tile_index in settings.discard_crop_sections:
+            continue
+
+        tile = tiles[tile_index]
         tile_path = os.path.join(settings.datadir, f"tile_{tile_index}.jpg")
         tile.save(tile_path)
 
@@ -143,12 +155,19 @@ def analyze_image(model, images_classes, imageBytes):
         image_array = np.expand_dims(image_array, axis=0)
 
         prediction = model.predict(image_array, verbose=0)
-        #pprint(prediction, depth=4)
-        idx = np.argmax(prediction)
-        image_class = images_classes[idx]
-        confidence_score = float(prediction[0][idx])  # Convert to native Python float
-        # confidence_score = (prediction[0][idx]).astype(np.float32)
-        # confidence_score = float(keras.ops.sigmoid(prediction[0][idx]))
+        top_score_index = np.argmax(prediction)
+        image_class = images_classes[top_score_index]
+        confidence_score = float(prediction[0][top_score_index])
+
+        clear_night_confidence = float(prediction[0][0])
+        light_clouds_night_confidence = float(prediction[0][1])
+        medium_clouds_night_confidence = float(prediction[0][2])
+        thick_clouds_night_confidence = float(prediction[0][3])
+
+        total_weighted_oktas += light_clouds_night_confidence * 0.5 * okta_factor
+        total_weighted_oktas += medium_clouds_night_confidence * 0.75 * okta_factor
+        total_weighted_oktas += thick_clouds_night_confidence * 1 * okta_factor
+
 
         ## keras v2
         # tile_rgb = tile.convert("RGB")
@@ -172,38 +191,30 @@ def analyze_image(model, images_classes, imageBytes):
         # confidence_score = prediction[0][index]
 
         # Print prediction and confidence score
-        print(f"Tile {tile_index:02} result: {image_class.ljust(6)} / {round(confidence_score * 100, 2)}% confidence")
+        if DEBUG:
+            pprint(prediction, depth=4)
+            print(f"Tile {tile_index:02} result: {image_class.ljust(6)} / {round(confidence_score * 100, 2)}% confidence")
 
         okta_score = 0
 
         if 'light_clouds' in image_class:
-            okta_score = 0.25
-        elif 'medium_clouds' in image_class:
             okta_score = 0.5
+        elif 'medium_clouds' in image_class:
+            okta_score = 0.75
         elif 'thick_clouds' in image_class:
             okta_score = 1
 
         total_oktas += (okta_score * okta_factor)
 
-        cloudy = image_class == "cloudy"
-
-        if cloudy:
-            cloudy_count += 1
-
         tile_results.append({
             "tile": tile_index,
             "class": image_class,
-            # "cloudy": cloudy,
             "confidence": round(confidence_score, 4)
         })
 
-        tile_index += 1
-
-    # total_count = tile_index
-
-    # cloudy_pct = round((cloudy_count / total_count) * 100.0, 1)
 
     total_oktas = int(round(total_oktas, 0))
+    total_weighted_oktas = int(round(total_weighted_oktas, 0))
     
     if total_oktas < 0:
         total_oktas = 0
@@ -211,10 +222,16 @@ def analyze_image(model, images_classes, imageBytes):
         total_oktas = 8
 
     cloudy_pct = total_oktas / 8
+    
+    end_time = datetime.now()
+    elapsed = end_time - start_time
+    elapsed_ms = round(elapsed.microseconds / 1000, 0)
 
     return({
         "cloud_coverage": cloudy_pct,
+        "elapsed_ms": elapsed_ms,
         "oktas": total_oktas,
+        "oktas_weighted": total_weighted_oktas,
         "tiles": tile_results
     })
 
