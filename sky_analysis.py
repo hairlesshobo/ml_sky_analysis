@@ -17,7 +17,7 @@ from config import settings
 VERSION = "0.1.0"
 DEBUG = False
 OVERRIDE = None
-OVERRIDE = "ccd1_20241223_214213.jpg"
+# OVERRIDE = "ccd1_20241223_214213.jpg"
 
 ## Don't change this unless trained with a different size
 IMAGE_SIZE = (256, 256)
