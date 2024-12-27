@@ -57,8 +57,8 @@ if len(sys.argv) < 2 or (sys.argv[1] != "night" and sys.argv[1] != "day"):
 destination_model = sys.argv[1]
 train_data_dir_root = "training"
 train_data_dir = os.path.join(train_data_dir_root, destination_model)
-model_output_path = os.path.join(train_data_dir_root, f"{train_data_dir_root}.keras")
-classes_output_path = os.path.join(train_data_dir_root, f"{train_data_dir_root}.classes")
+model_output_path = os.path.join(train_data_dir_root, f"{destination_model}.keras")
+classes_output_path = os.path.join(train_data_dir_root, f"{destination_model}.classes")
 
 if not os.path.isdir(train_data_dir):
     logger.error(f"Could not find the source training directory '{train_data_dir}'")
