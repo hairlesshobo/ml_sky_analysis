@@ -44,6 +44,12 @@ settings = Dynaconf(
             cast=int
         ),
 
+        Validator(
+            "crop_sections",
+            default=16,
+            cast=int
+        ),
+
         # Model file to use
         Validator(
             "model_data",
